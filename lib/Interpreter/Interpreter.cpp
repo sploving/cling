@@ -13,6 +13,7 @@
 #include "cling/Interpreter/CIFactory.h"
 #include "cling/Interpreter/ClangInternalState.h"
 #include "cling/Interpreter/CompilationOptions.h"
+#include "cling/Interpreter/DynamicLibraryManager.h"
 #include "cling/Interpreter/InterpreterCallbacks.h"
 #include "cling/Interpreter/LookupHelper.h"
 #include "cling/Interpreter/StoredValueRef.h"
@@ -33,30 +34,13 @@
 #include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaInternal.h"
 
-#include "llvm/Linker.h"
 #include "llvm/IR/LLVMContext.h"
-#include "llvm/Support/DynamicLibrary.h"
 #include "llvm/Support/Path.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/raw_os_ostream.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Support/FileSystem.h"
-#include "llvm/Support/Path.h"
 
-#include <iostream>
-#include <fstream>
-#include <set>
 #include <sstream>
-#include <stdio.h>
-#include <stdlib.h>
 #include <string>
 #include <vector>
-
-#ifdef WIN32
-#include <Windows.h>
-#else
-#include <dlfcn.h>
-#endif
 
 using namespace clang;
 
@@ -77,16 +61,23 @@ namespace {
   }
 } // unnamed namespace
 
-
-// "Declared" to the JIT in RuntimeUniverse.h
-extern "C" {
-  int cling__runtime__internal__local_cxa_atexit(void (*func) (void*), void* arg,
-                                                 void* dso,
-                                                 void* interp) {
-    return ((cling::Interpreter*)interp)->CXAAtExit(func, arg, dso);
-  }
+namespace cling {
+  namespace runtime {
+    namespace internal {
+      // "Declared" to the JIT in RuntimeUniverse.h
+      int local_cxa_atexit(void (*func) (void*), void* arg, void* dso,
+                           void* interp) {
+        Interpreter* cling = (cling::Interpreter*)interp;
+        IncrementalParser* incrP = cling->m_IncrParser.get();
+        // FIXME: Bind to the module symbols.
+        Decl* lastTLD = incrP->getLastTransaction()->getLastDecl().getSingleDecl();
+ 
+        int result = cling->m_ExecutionContext->CXAAtExit(func, arg, dso, lastTLD);
+        return result;
+      }
+    } // end namespace internal
+  } // end namespace runtime
 }
-
 
 
 namespace cling {
@@ -162,8 +153,6 @@ namespace cling {
     m_UniqueCounter(0), m_PrintAST(false), m_PrintIR(false), 
     m_DynamicLookupEnabled(false), m_RawInputEnabled(false) {
 
-    m_AtExitFuncs.reserve(200);
-
     m_LLVMContext.reset(new llvm::LLVMContext);
     std::vector<unsigned> LeftoverArgsIdx;
     m_Opts = InvocationOptions::CreateFromArgs(argc, argv, LeftoverArgsIdx);
@@ -172,6 +161,8 @@ namespace cling {
     for (size_t I = 0, N = LeftoverArgsIdx.size(); I < N; ++I) {
       LeftoverArgs.push_back(argv[LeftoverArgsIdx[I]]);
     }
+
+    m_DyLibManager.reset(new DynamicLibraryManager(getOptions()));
 
     m_IncrParser.reset(new IncrementalParser(this, LeftoverArgs.size(),
                                              &LeftoverArgs[0],
@@ -214,9 +205,6 @@ namespace cling {
       }
     }
 
-    m_ExecutionContext->addSymbol("cling__runtime__internal__local_cxa_atexit",
-                  (void*)(intptr_t)&cling__runtime__internal__local_cxa_atexit);
-
     // Enable incremental processing, which prevents the preprocessor destroying
     // the lexer on EOF token.
     getSema().getPreprocessor().enableIncrementalProcessing();
@@ -234,7 +222,7 @@ namespace cling {
       // Make sure that the universe won't be included to compile time by using
       // -D __CLING__ as CompilerInstance's arguments
 #ifdef _WIN32
-	  // We have to use the #defined __CLING__ on windows first. 
+      // We have to use the #defined __CLING__ on windows first. 
       //FIXME: Find proper fix.
       declare("#ifdef __CLING__ \n#endif");  
 #endif
@@ -249,6 +237,20 @@ namespace cling {
                     << (uintptr_t)this << ";} }";
         declare(initializer.str());
       }
+
+      // Find cling::runtime::internal::local_cxa_atexit
+      // We do not have an active transaction and that lookup might trigger
+      // deserialization
+      PushTransactionRAII pushedT(this);
+      NamespaceDecl* NSD = utils::Lookup::Namespace(&getSema(), "cling");
+      NSD = utils::Lookup::Namespace(&getSema(), "runtime");
+      NSD = utils::Lookup::Namespace(&getSema(), "internal");
+      NamedDecl* ND = utils::Lookup::Named(&getSema(), "local_cxa_atexit", NSD);
+      std::string mangledName;
+      maybeMangleDeclName(ND, mangledName);
+      m_ExecutionContext->addSymbol(mangledName.c_str(),
+                         (void*)(intptr_t)&runtime::internal::local_cxa_atexit);
+
     }
     else {
       declare("#include \"cling/Interpreter/CValuePrinter.h\"");
@@ -258,11 +260,6 @@ namespace cling {
 
   Interpreter::~Interpreter() {
     getCI()->getDiagnostics().getClient()->EndSourceFile();
-
-    for (size_t I = 0, N = m_AtExitFuncs.size(); I < N; ++I) {
-      const CXAAtExitElement& AEE = m_AtExitFuncs[N - I - 1];
-      (*AEE.m_Func)(AEE.m_Arg);
-    }
   }
 
   const char* Interpreter::getVersion() const {
@@ -748,7 +745,8 @@ namespace cling {
                         bool allowSharedLib /*=true*/) {
     if (allowSharedLib) {
       bool tryCode;
-      if (loadLibrary(filename, false, &tryCode) == kLoadLibSuccess)
+      if (getDynamicLibraryManager()->loadLibrary(filename, false, &tryCode)
+          == DynamicLibraryManager::kLoadLibSuccess)
         return kSuccess;
       if (!tryCode)
         return kFailure;
@@ -759,144 +757,6 @@ namespace cling {
     CompilationResult res = declare(code);
     return res;
   }
-
-  static llvm::sys::Path
-  findSharedLibrary(llvm::StringRef fileStem,
-                    const llvm::SmallVectorImpl<llvm::sys::Path>& Paths,
-                    bool& exists, bool& isDyLib) {
-    for (llvm::SmallVectorImpl<llvm::sys::Path>::const_iterator
-        IPath = Paths.begin(), EPath = Paths.end(); IPath != EPath; ++IPath) {
-      llvm::sys::Path ThisPath(*IPath);
-      ThisPath.appendComponent(fileStem);
-      exists = llvm::sys::fs::exists(ThisPath.str());
-      if (exists && ThisPath.isDynamicLibrary()) {
-        isDyLib = true;
-        return ThisPath;
-      }
-    }
-    return llvm::sys::Path();
-  }
-
-  Interpreter::LoadLibResult
-  Interpreter::tryLinker(const std::string& filename, bool permanent,
-                         bool isAbsolute, bool& exists, bool& isDyLib) {
-    using namespace llvm::sys;
-    exists = false;
-    isDyLib = false;
-    llvm::Module* module = m_IncrParser->getCodeGenerator()->GetModule();
-    assert(module && "Module must exist for linking!");
-
-    llvm::sys::Path FoundDyLib;
-
-    if (isAbsolute) {
-      exists = llvm::sys::fs::exists(filename.c_str());
-      if (exists && Path(filename).isDynamicLibrary()) {
-        isDyLib = true;
-        FoundDyLib = filename;
-      }
-    } else {
-      const InvocationOptions& Opts = getOptions();
-      llvm::SmallVector<Path, 16>
-      SearchPaths(Opts.LibSearchPath.begin(), Opts.LibSearchPath.end());
-
-      std::vector<Path> SysSearchPaths;
-      Path::GetSystemLibraryPaths(SysSearchPaths);
-      SearchPaths.append(SysSearchPaths.begin(), SysSearchPaths.end());
-
-      FoundDyLib = findSharedLibrary(filename, SearchPaths, exists, isDyLib);
-
-      std::string filenameWithExt(filename);
-      filenameWithExt += ("." + Path::GetDLLSuffix()).str();
-      if (!exists) {
-        // Add DyLib extension:
-        FoundDyLib = findSharedLibrary(filenameWithExt, SearchPaths, exists,
-                                       isDyLib);
-      }
-    }
-
-    if (!isDyLib)
-      return kLoadLibError;
-    
-    assert(!FoundDyLib.isEmpty() && "The shared lib exists but can't find it!");
-
-    //FIXME: This is meant to be an workaround for very hard to trace bug.
-    PushTransactionRAII RAII(this);
-
-    // TODO: !permanent case
-#ifdef WIN32
-    void* dyLibHandle = needs to be implemented!;
-    std::string errMsg;
-#else
-    const void* dyLibHandle
-      = dlopen(FoundDyLib.str().c_str(), RTLD_LAZY|RTLD_GLOBAL);
-    std::string errMsg;
-    if (const char* DyLibError = dlerror()) {
-      errMsg = DyLibError;
-    }
-#endif
-    if (!dyLibHandle) {
-      llvm::errs() << "cling::Interpreter::tryLinker(): " << errMsg << '\n';
-      return kLoadLibError;
-    }
-    std::pair<DyLibs::iterator, bool> insRes
-      = m_DyLibs.insert(std::pair<DyLibHandle, std::string>(dyLibHandle, 
-                                                            FoundDyLib.str()));
-    if (!insRes.second)
-      return kLoadLibExists;
-    return kLoadLibSuccess;
-  }
-
-  Interpreter::LoadLibResult
-  Interpreter::loadLibrary(const std::string& filename, bool permanent,
-                           bool* tryCode) {
-    //FIXME: This is meant to be an workaround for very hard to trace bug.
-    PushTransactionRAII RAII(this);
-    // If it's not an absolute path, prepend "lib"
-    SmallVector<char, 128> Absolute(filename.c_str(),
-                                    filename.c_str() + filename.length());
-    Absolute.push_back(0);
-    llvm::sys::fs::make_absolute(Absolute);
-    bool isAbsolute = filename == Absolute.data();
-    bool exists = false;
-    bool isDyLib = false;
-    LoadLibResult res = tryLinker(filename, permanent, isAbsolute, exists,
-                                  isDyLib);
-    if (tryCode) {
-      *tryCode = !isDyLib;
-      if (isAbsolute)
-        *tryCode &= exists;
-    }
-    if (exists)
-      return res;
-
-    if (!isAbsolute && filename.compare(0, 3, "lib")) {
-      // try with "lib" prefix:
-      res = tryLinker("lib" + filename, permanent, false, exists, isDyLib);
-      if (tryCode) {
-        *tryCode = !isDyLib;
-        if (isAbsolute)
-          *tryCode &= exists;
-      }
-      if (res != kLoadLibError)
-        return res;
-    }
-    return kLoadLibError;
-  }
-
-  bool Interpreter::isDynamicLibraryLoaded(llvm::StringRef fullPath) const {
-    for(DyLibs::const_iterator I = m_DyLibs.begin(), E = m_DyLibs.end(); 
-        I != E; ++I) {
-      if (fullPath.equals((I->second)))
-        return true;
-    }
-    return false;
-  }
-
-  void
-  Interpreter::ExposeHiddenSharedLibrarySymbols(void* DyLibHandle) {
-    llvm::sys::DynamicLibrary::addPermanentLibrary(const_cast<void*>(DyLibHandle));
-  }
-
 
   void Interpreter::installLazyFunctionCreator(void* (*fp)(const std::string&)) {
     m_ExecutionContext->installLazyFunctionCreator(fp);
@@ -980,22 +840,8 @@ namespace cling {
     return ConvertExecutionResult(ExeRes);
   }
 
-  Interpreter::ExecutionResult
-  Interpreter::runStaticDestructorsOnce() {
-    for (size_t I = 0, E = m_AtExitFuncs.size(); I < E; ++I) {
-      const CXAAtExitElement& AEE = m_AtExitFuncs[E-I-1];
-      (*AEE.m_Func)(AEE.m_Arg);
-    }
-    m_AtExitFuncs.clear();
-    return kExeSuccess; 
-  }
-
-  int Interpreter::CXAAtExit(void (*func) (void*), void* arg, void* dso) {
-    // Register a CXAAtExit function
-    Decl* LastTLD 
-      = m_IncrParser->getLastTransaction()->getLastDecl().getSingleDecl();
-    m_AtExitFuncs.push_back(CXAAtExitElement(func, arg, dso, LastTLD));
-    return 0; // happiness
+  void Interpreter::runStaticDestructorsOnce() {
+    m_ExecutionContext->runStaticDestructorsOnce(getModule());
   }
 
   void Interpreter::maybeMangleDeclName(const clang::NamedDecl* D,
@@ -1058,7 +904,7 @@ namespace cling {
     if (!symbolName || !symbolAddress )
       return false;
 
-    return m_ExecutionContext->addSymbol(symbolName,  symbolAddress);
+    return m_ExecutionContext->addSymbol(symbolName, symbolAddress);
   }
 
   void* Interpreter::getAddressOfGlobal(const clang::NamedDecl* D,

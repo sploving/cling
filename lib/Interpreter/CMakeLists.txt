@@ -24,8 +24,10 @@ add_cling_library(clingInterpreter
   ASTNodeEraser.cpp
   AutoSynthesizer.cpp
   CIFactory.cpp
+  ClangInternalState.cpp
   DeclCollector.cpp
   DeclExtractor.cpp
+  DynamicLibraryManager.cpp
   DynamicLookup.cpp
   DynamicExprInfo.cpp
   ExecutionContext.cpp

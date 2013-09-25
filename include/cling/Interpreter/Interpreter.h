@@ -9,13 +9,10 @@
 
 #include "cling/Interpreter/InvocationOptions.h"
 
-//#include "llvm/ADT/DenseMap.h"
-#include <map>
 #include "llvm/ADT/OwningPtr.h"
 #include "llvm/ADT/StringRef.h"
 
 #include <string>
-#include <vector>
 #include <cstdlib>
 
 namespace llvm {
@@ -46,6 +43,9 @@ namespace clang {
 namespace cling {
   namespace runtime {
     namespace internal {
+      int local_cxa_atexit(void (*func) (void*), void* arg, void* dso, 
+                           void* interp);
+
       class DynamicExprInfo;
       template <typename T>
       T EvaluateT(DynamicExprInfo* ExprInfo, clang::DeclContext* DC);
@@ -54,6 +54,7 @@ namespace cling {
   }
   class ClangInternalState;
   class CompilationOptions;
+  class DynamicLibraryManager;
   class ExecutionContext;
   class IncrementalParser;
   class InterpreterCallbacks;
@@ -87,15 +88,6 @@ namespace cling {
       kSuccess,
       kFailure,
       kMoreInputExpected
-    };
-
-    ///\brief Describes the result of loading a library.
-    ///
-    enum LoadLibResult {
-      kLoadLibSuccess, // library loaded successfully
-      kLoadLibExists,  // library was already loaded
-      kLoadLibError, // library was not found
-      kLoadLibNumResults
     };
 
     ///\brief Describes the result of running a function.
@@ -171,73 +163,13 @@ namespace cling {
     ///
     llvm::OwningPtr<InterpreterCallbacks> m_Callbacks;
 
-    ///\breif Helper that manages when the destructor of an object to be called.
+    ///\brief Dynamic library manager object.
     ///
-    /// The object is registered first as an CXAAtExitElement and then cling
-    /// takes the control of it's destruction.
-    ///
-    struct CXAAtExitElement {
-      ///\brief Constructs an element, whose destruction time will be managed by
-      /// the interpreter. (By registering a function to be called by exit
-      /// or when a shared library is unloaded.)
-      ///
-      /// Registers destructors for objects with static storage duration with
-      /// the _cxa atexit function rather than the atexit function. This option
-      /// is required for fully standards-compliant handling of static
-      /// destructors(many of them created by cling), but will only work if
-      /// your C library supports __cxa_atexit (means we have our own work
-      /// around for Windows). More information about __cxa_atexit could be
-      /// found in the Itanium C++ ABI spec.
-      ///
-      ///\param [in] func - The function to be called on exit or unloading of
-      ///                   shared lib.(The destructor of the object.)
-      ///\param [in] arg - The argument the func to be called with.
-      ///\param [in] dso - The dynamic shared object handle.
-      ///\param [in] fromTLD - The unloading of this top level declaration will
-      ///                      trigger the atexit function.
-      ///
-      CXAAtExitElement(void (*func) (void*), void* arg, void* dso,
-                       clang::Decl* fromTLD):
-        m_Func(func), m_Arg(arg), m_DSO(dso), m_FromTLD(fromTLD) {}
-
-      ///\brief The function to be called.
-      ///
-      void (*m_Func)(void*);
-
-      ///\brief The single argument passed to the function.
-      ///
-      void* m_Arg;
-
-      /// \brief The DSO handle.
-      ///
-      void* m_DSO;
-
-      ///\brief Clang's top level declaration, whose unloading will trigger the
-      /// call this atexit function.
-      ///
-      clang::Decl* m_FromTLD;
-    };
-
-    ///\brief Static object, which are bound to unloading of certain declaration
-    /// to be destructed.
-    ///
-    std::vector<CXAAtExitElement> m_AtExitFuncs;
-
-    typedef const void* DyLibHandle;
-    //typedef llvm::DenseMap<DyLibHandle, std::string> DyLibs;
-    typedef std::map<DyLibHandle, std::string> DyLibs;
-    ///\brief DynamicLibraries loaded by this Interpreter.
-    ///
-    DyLibs m_DyLibs;
+    llvm::OwningPtr<DynamicLibraryManager> m_DyLibManager;
 
     ///\brief Information about the last stored states through .storeState
     ///
     mutable std::vector<ClangInternalState*> m_StoredStates;
-
-    ///\brief Try to load a library file via the llvm::Linker.
-    ///
-    LoadLibResult tryLinker(const std::string& filename, bool permanent,
-                            bool isAbsolute, bool& exists, bool& isDyLib);
 
     ///\brief Processes the invocation options.
     ///
@@ -540,7 +472,7 @@ namespace cling {
     /// @param[in] T - The cling::Transaction that contains the declarations and
     ///                the compilation/generation options.
     ///
-    ///\returns Whether the operation was fully successfil.
+    ///\returns Whether the operation was fully successful.
     ///
     CompilationResult emitAllDecls(Transaction* T);
 
@@ -554,32 +486,6 @@ namespace cling {
     ///
     CompilationResult loadFile(const std::string& filename,
                                bool allowSharedLib = true);
-
-    ///\brief Loads a shared library.
-    ///
-    ///\param [in] filename - The file to loaded.
-    ///\param [in] permanent - If false, the file can be unloaded later.
-    ///\param [out] tryCode - If not NULL, it will be set to false if this file
-    ///        cannot be included.
-    ///
-    ///\returns kLoadLibSuccess on success, kLoadLibExists if the library was
-    /// already loaded, kLoadLibError if the library cannot be found or any
-    /// other error was encountered.
-    ///
-    LoadLibResult loadLibrary(const std::string& filename, bool permanent,
-                              bool *tryCode = 0);
-
-    ///\brief Returns true if the file was a dynamic library and it was already
-    /// loaded.
-    ///
-    bool isDynamicLibraryLoaded(llvm::StringRef fullPath) const;
-
-    ///\brief Explicitly tell the execution engine to use symbols from
-    ///       a shared library that would otherwise not be used for symbol
-    ///       resolution, e.g. because it was dlopened with RTLD_LOCAL.
-    ///\param [in] DyLibHandle - the system specific shared library handle.
-    ///
-    static void ExposeHiddenSharedLibrarySymbols(void* DyLibHandle);
 
     bool isPrintingAST() const { return m_PrintAST; }
     void enablePrintAST(bool print = true) { m_PrintAST = print; }
@@ -607,10 +513,8 @@ namespace cling {
     //FIXME: Terrible hack to let the IncrementalParser run static inits on
     // transaction completed.
     ExecutionResult runStaticInitializersOnce(const Transaction& T) const;
-
-    ExecutionResult runStaticDestructorsOnce();
-
-    int CXAAtExit(void (*func) (void*), void* arg, void* dso);
+    //FIXME: Interface that doesn't make a lot of sense for cling standalone
+    void runStaticDestructorsOnce();
 
     ///\brief Evaluates given expression within given declaration context.
     ///
@@ -630,6 +534,13 @@ namespace cling {
     void setCallbacks(InterpreterCallbacks* C);
     const InterpreterCallbacks* getCallbacks() const {return m_Callbacks.get();}
     InterpreterCallbacks* getCallbacks() { return m_Callbacks.get(); }
+
+    const DynamicLibraryManager* getDynamicLibraryManager() const {
+      return m_DyLibManager.get();
+    }
+    DynamicLibraryManager* getDynamicLibraryManager() {
+      return m_DyLibManager.get();
+    }
 
     // FIXME: remove once modules are there; see
     // DeclCollector::HandleTopLevelDecl().
@@ -667,6 +578,9 @@ namespace cling {
     const llvm::Type* getLLVMType(clang::QualType QT);
 
     friend class runtime::internal::LifetimeHandler;
+    friend int runtime::internal::local_cxa_atexit(void (*func) (void*), 
+                                                   void* arg, void* dso,
+                                                   void* interp);
   };
 
   namespace internal {
